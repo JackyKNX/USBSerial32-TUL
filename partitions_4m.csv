@@ -1,0 +1,12 @@
+# USBSerial32 TUL -- 4 MB flash
+# OTA A/B:
+#   ota_0: 0x10000 - 0x110000 = 1 MB
+#   ota_1: 0x110000 - 0x210000 = 1 MB
+#
+# Name, Type, SubType, Offset, Size, Flags
+
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xE000,   0x2000,
+ota_0,    app,  ota_0,    0x10000,  0x100000,
+ota_1,    app,  ota_1,    0x110000, 0x100000,
+coredump, data, coredump, 0x210000, 0x10000,
