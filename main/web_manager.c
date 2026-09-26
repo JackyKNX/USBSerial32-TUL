@@ -370,8 +370,19 @@ static esp_err_t handle_root(httpd_req_t *req)
     uint32_t uptime = (uint32_t)(esp_timer_get_time() / 1000000ULL);
     uint32_t free_heap = esp_get_free_heap_size();
     uint32_t min_heap = esp_get_minimum_free_heap_size();
+    uint8_t wifi_mac[6] = {0};
+    char wifi_mac_text[18] = "00:00:00:00:00:00";
     esp_reset_reason_t reset_reason = esp_reset_reason();
     const char *reset_text = "Unknown";
+
+    if (esp_wifi_get_mac(WIFI_IF_STA, wifi_mac) == ESP_OK) {
+        snprintf(
+            wifi_mac_text,
+            sizeof(wifi_mac_text),
+            "%02X:%02X:%02X:%02X:%02X:%02X",
+            wifi_mac[0], wifi_mac[1], wifi_mac[2],
+            wifi_mac[3], wifi_mac[4], wifi_mac[5]);
+    }
 
     switch (reset_reason) {
         case ESP_RST_POWERON: reset_text = "Power-on"; break;
@@ -413,6 +424,7 @@ static esp_err_t handle_root(httpd_req_t *req)
         "<div class='card'><h2>Network</h2>"
         "<div class='row'><span class='label'>Mode</span><span class='value'>%s</span></div>"
         "<div class='row'><span class='label'>IP address</span><span class='value'>%s</span></div>"
+        "<div class='row'><span class='label'>WiFi MAC</span><span class='value'>%s</span></div>"
         "<div class='row'><span class='label'>SSID</span><span class='value'>%s</span></div></div>"
         "<div class='card'><h2>System Health</h2>"
         "<div class='row'><span class='label'>Firmware</span><span class='value'>%s</span></div>"
@@ -451,7 +463,7 @@ static esp_err_t handle_root(httpd_req_t *req)
         "<p></p></div>"
         "<div class='card'><h2>API</h2><p><a href='/api/status'>System status JSON</a></p></div>"
         "</div></div></body></html>",
-        BW_VERSION, mode,current_ip(),ssid,BW_VERSION,(unsigned long)uptime,
+        BW_VERSION, mode,current_ip(),wifi_mac_text,ssid,BW_VERSION,(unsigned long)uptime,
         (unsigned long)(free_heap/1024UL),(unsigned long)(min_heap/1024UL),reset_text,
         running ? running->label : "",transceiver_ok?"ok":"warn",transceiver_ok?"OK":"Not OK",
         host_seen?"Yes":"No",(unsigned long)bridge_knx_rx_bytes(),(unsigned long)bridge_knx_tx_bytes(),
