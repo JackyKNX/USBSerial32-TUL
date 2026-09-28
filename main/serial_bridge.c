@@ -360,7 +360,8 @@ uint32_t bridge_probe_attempts(void)
 
 bool bridge_transceiver_ok(void)
 {
-    return atomic_load(&s_tx_ok);
+    return atomic_load(&s_tx_ok)
+        || atomic_load(&s_knx_rx_bytes) > 0;
 }
 
 bool bridge_host_seen(void)
