@@ -359,6 +359,43 @@ static const char *current_ip(void)
 /* Root                                                                       */
 /* -------------------------------------------------------------------------- */
 
+
+static void format_uptime(uint32_t seconds, char *out, size_t out_size)
+{
+    uint32_t days = seconds / 86400;
+    seconds %= 86400;
+
+    uint32_t hours = seconds / 3600;
+    seconds %= 3600;
+
+    uint32_t minutes = seconds / 60;
+    uint32_t secs = seconds % 60;
+
+    if (days > 0) {
+        snprintf(out, out_size,
+                 "%lu days, %luh, %lum, %lu sec",
+                 (unsigned long)days,
+                 (unsigned long)hours,
+                 (unsigned long)minutes,
+                 (unsigned long)secs);
+    } else if (hours > 0) {
+        snprintf(out, out_size,
+                 "%luh, %lum, %lu sec",
+                 (unsigned long)hours,
+                 (unsigned long)minutes,
+                 (unsigned long)secs);
+    } else if (minutes > 0) {
+        snprintf(out, out_size,
+                 "%lum, %lu sec",
+                 (unsigned long)minutes,
+                 (unsigned long)secs);
+    } else {
+        snprintf(out, out_size,
+                 "%lu sec",
+                 (unsigned long)secs);
+    }
+}
+
 static esp_err_t handle_root(httpd_req_t *req)
 {
     char *html = malloc(14000);
@@ -368,7 +405,10 @@ static esp_err_t handle_root(httpd_req_t *req)
     const char *ssid = s_ap_mode ? "TUL setup AP" : s_wifi_ssid;
     const esp_partition_t *running = esp_ota_get_running_partition();
     uint32_t uptime = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    char uptime_text[64];
     uint32_t free_heap = esp_get_free_heap_size();
+    format_uptime(uptime, uptime_text, sizeof(uptime_text));
+
     uint32_t min_heap = esp_get_minimum_free_heap_size();
     uint8_t wifi_mac[6] = {0};
     char wifi_mac_text[18] = "00:00:00:00:00:00";
@@ -428,7 +468,7 @@ static esp_err_t handle_root(httpd_req_t *req)
         "<div class='row'><span class='label'>SSID</span><span class='value'>%s</span></div></div>"
         "<div class='card'><h2>System Health</h2>"
         "<div class='row'><span class='label'>Firmware</span><span class='value'>%s</span></div>"
-        "<div class='row'><span class='label'>Uptime</span><span class='value'>%lu s</span></div>"
+        "<div class='row'><span class='label'>Uptime</span><span class='value'>%s</span></div>"
         "<div class='row'><span class='label'>Free heap</span><span class='value'>%lu KB</span></div>"
         "<div class='row'><span class='label'>Minimum heap</span><span class='value'>%lu KB</span></div>"
         "<div class='row'><span class='label'>Reset reason</span><span class='value'>%s</span></div>"
@@ -463,7 +503,7 @@ static esp_err_t handle_root(httpd_req_t *req)
         "<p></p></div>"
         "<div class='card'><h2>API</h2><p><a href='/api/status'>System status JSON</a></p></div>"
         "</div></div></body></html>",
-        BW_VERSION, mode,current_ip(),wifi_mac_text,ssid,BW_VERSION,(unsigned long)uptime,
+        BW_VERSION, mode,current_ip(),wifi_mac_text,ssid,BW_VERSION,uptime_text,
         (unsigned long)(free_heap/1024UL),(unsigned long)(min_heap/1024UL),reset_text,
         running ? running->label : "",transceiver_ok?"ok":"warn",transceiver_ok?"OK":"Not OK",
         host_seen?"Yes":"No",(unsigned long)bridge_knx_rx_bytes(),(unsigned long)bridge_knx_tx_bytes(),
