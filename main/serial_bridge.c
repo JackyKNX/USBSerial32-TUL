@@ -75,12 +75,15 @@ static void say(const char *msg)
 #if BW_QUIET
     (void)msg;
 #else
-    usb_serial_jtag_write_bytes(
-        (const uint8_t *)msg,
-        strlen(msg),
-        pdMS_TO_TICKS(200));
+    if (usb_serial_jtag_is_connected()) {
+        (void)usb_serial_jtag_write_bytes(
+            (const uint8_t *)msg,
+            strlen(msg),
+            0);
+    }
 #endif
 }
+
 
 static void banner_ok(void)
 {
@@ -194,9 +197,6 @@ static void uart_to_usb(void *arg)
         if (n <= 0)
             continue;
 
-        // Solange der Test laeuft, kommt die Antwort hier an -- nur dieser Task
-        // liest die UART. Weitergereicht wird sie trotzdem: verschlucken waere
-        // eine Luege gegenueber einem Host, der schon zuhoert.
         if (!atomic_load(&s_tx_ok)
             && !atomic_load(&s_host_seen)
             && bw_probe_match(buf, n)) {
@@ -206,18 +206,21 @@ static void uart_to_usb(void *arg)
             banner_ok();
         }
 
-        // Originaler transparenter Bridge-Pfad.
-        usb_serial_jtag_write_bytes(
-            buf,
-            n,
-            portMAX_DELAY);
+        /*
+         * USB is secondary to KNX.
+         * Never block the KNX UART task waiting for USB.
+         */
+        if (usb_serial_jtag_is_connected()) {
+            (void)usb_serial_jtag_write_bytes(
+                buf,
+                n,
+                0);
+        }
 
-        // ---------------------------------------------------------------
-        // Web Serial Monitor
-        //
-        // Nur Kopia des Datenstroms.
-        // NICHT wysyła nic z powrotem do KNX.
-        // ---------------------------------------------------------------
+        /*
+         * Web Serial Monitor is diagnostic only.
+         * It never feeds data back to KNX.
+         */
         for (int i = 0; i < n; i++)
             web_manager_log_byte('R', buf[i]);
 
@@ -234,6 +237,7 @@ static void uart_to_usb(void *arg)
             (unsigned)n);
     }
 }
+
 
 static void usb_to_uart(void *arg)
 {

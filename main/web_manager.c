@@ -25,7 +25,9 @@
 #include "nvs_flash.h"
 
 #define WEB_PORT                    80
-#define WIFI_CONNECT_TIMEOUT_MS    10000
+#define WIFI_RETRY_DELAY_MS        3000
+#define WIFI_RETRY_MAX_DELAY_MS    30000
+#define WIFI_AP_FALLBACK_MS        30000
 
 #define AP_PASSWORD                "tulsetup"
 
@@ -38,6 +40,11 @@ static httpd_handle_t s_server = NULL;
 static EventGroupHandle_t s_wifi_event_group = NULL;
 
 static bool s_ap_mode = false;
+static bool s_wifi_started = false;
+static volatile bool s_wifi_reconfiguring = false;
+static bool s_sta_has_ip = false;
+static int32_t s_last_disconnect_reason = -1;
+static uint32_t s_disconnect_count = 0;
 
 static char s_wifi_ssid[64] = "";
 static char s_wifi_password[64] = "";
@@ -188,50 +195,75 @@ static void wifi_event_handler(
     void *event_data)
 {
     (void)arg;
-    (void)event_data;
 
     if (event_base == WIFI_EVENT) {
 
         if (event_id == WIFI_EVENT_STA_START) {
-            esp_wifi_connect();
+            if (!s_ap_mode &&
+                s_wifi_started &&
+                !s_wifi_reconfiguring) {
+                (void)esp_wifi_connect();
+            }
         }
 
         else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+            wifi_event_sta_disconnected_t *event = event_data;
 
-            if (!s_ap_mode)
-                esp_wifi_connect();
+            s_sta_has_ip = false;
+            s_disconnect_count++;
+
+            if (event)
+                s_last_disconnect_reason = event->reason;
+            else
+                s_last_disconnect_reason = -1;
 
             xEventGroupClearBits(
                 s_wifi_event_group,
                 WIFI_CONNECTED_BIT);
+
+            /*
+             * Reconnect is deliberately owned by wifi_worker_task().
+             * Calling esp_wifi_connect() from the system event callback
+             * can race with esp_wifi_start()/esp_wifi_stop()/set_mode().
+             */
         }
     }
 
     else if (event_base == IP_EVENT &&
              event_id == IP_EVENT_STA_GOT_IP) {
 
+        s_sta_has_ip = true;
+
         xEventGroupSetBits(
+            s_wifi_event_group,
+            WIFI_CONNECTED_BIT);
+    }
+
+    else if (event_base == IP_EVENT &&
+             event_id == IP_EVENT_STA_LOST_IP) {
+
+        s_sta_has_ip = false;
+
+        xEventGroupClearBits(
             s_wifi_event_group,
             WIFI_CONNECTED_BIT);
     }
 }
 
-static void wifi_start_ap(void)
+static esp_err_t wifi_start_ap(void)
 {
     wifi_config_t cfg = {0};
-
     uint8_t mac[6] = {0};
 
-    ESP_ERROR_CHECK(
-        esp_wifi_get_mac(WIFI_IF_AP, mac));
+    esp_err_t err = esp_wifi_get_mac(WIFI_IF_AP, mac);
+    if (err != ESP_OK)
+        return err;
 
     snprintf(
         (char *)cfg.ap.ssid,
         sizeof(cfg.ap.ssid),
         "TUL-%02X%02X%02X",
-        mac[3],
-        mac[4],
-        mac[5]);
+        mac[3], mac[4], mac[5]);
 
     copy_string(
         (char *)cfg.ap.password,
@@ -243,24 +275,41 @@ static void wifi_start_ap(void)
     cfg.ap.max_connection = 4;
     cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
-    ESP_ERROR_CHECK(
-        esp_wifi_set_mode(WIFI_MODE_AP));
-
-    ESP_ERROR_CHECK(
-        esp_wifi_set_config(
-            WIFI_IF_AP,
-            &cfg));
-
-    ESP_ERROR_CHECK(
-        esp_wifi_start());
-
+    /* AP is a recovery interface. Keep STA alive in parallel. */
+    s_wifi_reconfiguring = true;
     s_ap_mode = true;
+
+    err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) {
+        s_ap_mode = false;
+        s_wifi_reconfiguring = false;
+        return err;
+    }
+
+    err = esp_wifi_set_config(WIFI_IF_AP, &cfg);
+    if (err != ESP_OK) {
+        s_ap_mode = false;
+        s_wifi_reconfiguring = false;
+        return err;
+    }
+
+    if (!s_wifi_started) {
+        err = esp_wifi_start();
+        if (err != ESP_OK) {
+            s_wifi_reconfiguring = false;
+            return err;
+        }
+        s_wifi_started = true;
+    }
+
+    s_wifi_reconfiguring = false;
+    return ESP_OK;
 }
 
-static bool wifi_start_sta(void)
+static esp_err_t wifi_start_sta(void)
 {
     if (s_wifi_ssid[0] == '\0')
-        return false;
+        return ESP_ERR_INVALID_STATE;
 
     wifi_config_t cfg = {0};
 
@@ -274,36 +323,145 @@ static bool wifi_start_sta(void)
         sizeof(cfg.sta.password),
         s_wifi_password);
 
+    cfg.sta.scan_method = WIFI_FAST_SCAN;
+    cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    cfg.sta.pmf_cfg.capable = true;
+    cfg.sta.pmf_cfg.required = false;
+
+    s_wifi_reconfiguring = true;
     s_ap_mode = false;
+    s_sta_has_ip = false;
 
     xEventGroupClearBits(
         s_wifi_event_group,
         WIFI_CONNECTED_BIT);
 
-    ESP_ERROR_CHECK(
-        esp_wifi_set_mode(WIFI_MODE_STA));
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        s_wifi_reconfiguring = false;
+        return err;
+    }
 
-    ESP_ERROR_CHECK(
-        esp_wifi_set_config(
-            WIFI_IF_STA,
-            &cfg));
+    err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    if (err != ESP_OK) {
+        s_wifi_reconfiguring = false;
+        return err;
+    }
 
-    ESP_ERROR_CHECK(
-        esp_wifi_start());
+    err = esp_wifi_set_ps(WIFI_PS_NONE);
+    if (err != ESP_OK) {
+        s_wifi_reconfiguring = false;
+        return err;
+    }
 
-    EventBits_t bits = xEventGroupWaitBits(
-        s_wifi_event_group,
-        WIFI_CONNECTED_BIT,
-        pdFALSE,
-        pdFALSE,
-        pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+    if (!s_wifi_started) {
+        err = esp_wifi_start();
+        if (err != ESP_OK) {
+            s_wifi_reconfiguring = false;
+            return err;
+        }
+        s_wifi_started = true;
+    }
 
-    if (bits & WIFI_CONNECTED_BIT)
-        return true;
+    s_wifi_reconfiguring = false;
 
-    esp_wifi_stop();
+    /* Connection is asynchronous. wifi_worker_task owns retries. */
+    return ESP_OK;
+}
 
-    return false;
+static void wifi_worker_task(void *arg)
+{
+    (void)arg;
+
+    uint32_t retry_delay = WIFI_RETRY_DELAY_MS;
+    TickType_t ap_deadline = 0;
+
+    while (1) {
+
+        if (s_wifi_ssid[0] == '\0') {
+            /* No configured STA: AP is the only recovery path. */
+            if (!s_ap_mode)
+                (void)wifi_start_ap();
+
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (s_sta_has_ip) {
+            retry_delay = WIFI_RETRY_DELAY_MS;
+            ap_deadline = 0;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* If WiFi is not started, start it before attempting STA connect. */
+        if (!s_wifi_started) {
+            s_wifi_reconfiguring = true;
+
+            esp_err_t start_err = esp_wifi_start();
+
+            if (start_err == ESP_OK) {
+                s_wifi_started = true;
+            } else {
+                s_wifi_reconfiguring = false;
+                vTaskDelay(pdMS_TO_TICKS(retry_delay));
+                continue;
+            }
+
+            s_wifi_reconfiguring = false;
+        }
+
+        /* If we are in recovery AP mode, keep trying STA in the background. */
+        if (s_ap_mode && ap_deadline == 0)
+            ap_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(WIFI_AP_FALLBACK_MS);
+
+        esp_err_t err = esp_wifi_connect();
+
+        if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+            /* Driver rejected the request; retry with back-off. */
+            vTaskDelay(pdMS_TO_TICKS(retry_delay));
+        } else {
+            /*
+             * The driver is now connecting asynchronously.  The event
+             * handler owns the state transition when GOT_IP arrives.
+             */
+            vTaskDelay(pdMS_TO_TICKS(retry_delay));
+
+            if (retry_delay < WIFI_RETRY_MAX_DELAY_MS)
+                retry_delay *= 2;
+
+            if (retry_delay > WIFI_RETRY_MAX_DELAY_MS)
+                retry_delay = WIFI_RETRY_MAX_DELAY_MS;
+        }
+
+        if (s_sta_has_ip) {
+            retry_delay = WIFI_RETRY_DELAY_MS;
+            ap_deadline = 0;
+
+            /* AP is only a recovery interface. Drop it after STA is back. */
+            if (s_ap_mode) {
+                (void)wifi_start_sta();
+            }
+
+            continue;
+        }
+
+        if (!s_sta_has_ip && !s_ap_mode) {
+            /*
+             * Do not make the device disappear from the network permanently
+             * after one slow boot.  First wait for a full retry window, then
+             * expose the setup AP while STA retries continue.
+             */
+            if (ap_deadline == 0)
+                ap_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(WIFI_AP_FALLBACK_MS);
+
+            if ((int32_t)(xTaskGetTickCount() - ap_deadline) >= 0) {
+                (void)wifi_start_ap();
+                ap_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(WIFI_AP_FALLBACK_MS);
+            }
+        }
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -465,7 +623,10 @@ static esp_err_t handle_root(httpd_req_t *req)
         "<div class='row'><span class='label'>Mode</span><span class='value'>%s</span></div>"
         "<div class='row'><span class='label'>IP address</span><span class='value'>%s</span></div>"
         "<div class='row'><span class='label'>WiFi MAC</span><span class='value'>%s</span></div>"
-        "<div class='row'><span class='label'>SSID</span><span class='value'>%s</span></div></div>"
+        "<div class='row'><span class='label'>SSID</span><span class='value'>%s</span></div>"
+        "<div class='row'><span class='label'>WiFi status</span><span class='value %s'>%s</span></div>"
+        "<div class='row'><span class='label'>Disconnects</span><span class='value'>%lu</span></div>"
+        "<div class='row'><span class='label'>Last disconnect reason</span><span class='value'>%ld</span></div></div>"
         "<div class='card'><h2>System Health</h2>"
         "<div class='row'><span class='label'>Firmware</span><span class='value'>%s</span></div>"
         "<div class='row'><span class='label'>Uptime</span><span class='value'>%s</span></div>"
@@ -503,7 +664,12 @@ static esp_err_t handle_root(httpd_req_t *req)
         "<p></p></div>"
         "<div class='card'><h2>API</h2><p><a href='/api/status'>System status JSON</a></p></div>"
         "</div></div></body></html>",
-        BW_VERSION, mode,current_ip(),wifi_mac_text,ssid,BW_VERSION,uptime_text,
+        BW_VERSION, mode,current_ip(),wifi_mac_text,ssid,
+        s_sta_has_ip ? "ok" : "warn",
+        s_sta_has_ip ? "Connected" : (s_ap_mode ? "Recovery AP" : "Connecting"),
+        (unsigned long)s_disconnect_count,
+        (long)s_last_disconnect_reason,
+        BW_VERSION,uptime_text,
         (unsigned long)(free_heap/1024UL),(unsigned long)(min_heap/1024UL),reset_text,
         running ? running->label : "",transceiver_ok?"ok":"warn",transceiver_ok?"OK":"Not OK",
         host_seen?"Yes":"No",(unsigned long)bridge_knx_rx_bytes(),(unsigned long)bridge_knx_tx_bytes(),
@@ -540,7 +706,7 @@ static esp_err_t handle_status(httpd_req_t *req)
     }
     char json[1536];
     snprintf(json,sizeof(json),
-        "{\"mode\":\"%s\",\"ip\":\"%s\",\"ssid\":\"%s\","
+        "{\"mode\":\"%s\",\"ip\":\"%s\",\"ssid\":\"%s\",\"wifi_connected\":%s,\"wifi_disconnects\":%lu,\"wifi_last_disconnect_reason\":%ld,"
         "\"mqtt_enabled\":%s,\"mqtt_connected\":%s,\"mqtt_host\":\"%s\","
         "\"mqtt_port\":%u,\"mqtt_topic\":\"%s\",\"firmware\":\"%s\","
         "\"uptime\":%lu,\"free_heap\":%lu,\"min_heap\":%lu,\"reset_reason\":\"%s\","
@@ -548,6 +714,9 @@ static esp_err_t handle_status(httpd_req_t *req)
         "\"usb_rx\":%lu,\"usb_tx\":%lu,\"running_partition\":\"%s\","
         "\"running_address\":\"0x%lx\",\"next_partition\":\"%s\"}",
         s_ap_mode?"AP":"STA",current_ip(),s_ap_mode?"":s_wifi_ssid,
+        s_sta_has_ip?"true":"false",
+        (unsigned long)s_disconnect_count,
+        (long)s_last_disconnect_reason,
         mqtt_manager_enabled()?"true":"false",mqtt_manager_connected()?"true":"false",
         mqtt_manager_host(),(unsigned)mqtt_manager_port(),mqtt_manager_topic(),BW_VERSION,
         (unsigned long)uptime,(unsigned long)free_heap,(unsigned long)min_heap,reset_text,
@@ -1670,6 +1839,13 @@ void web_manager_start(void)
             &wifi_event_handler,
             NULL));
 
+    ESP_ERROR_CHECK(
+        esp_event_handler_register(
+            IP_EVENT,
+            IP_EVENT_STA_LOST_IP,
+            &wifi_event_handler,
+            NULL));
+
     wifi_init_config_t wifi_cfg =
         WIFI_INIT_CONFIG_DEFAULT();
 
@@ -1678,8 +1854,21 @@ void web_manager_start(void)
 
     wifi_load_config();
 
-    if (!wifi_start_sta())
-        wifi_start_ap();
+    /*
+     * Start the normal STA path first.  A slow DHCP/authentication sequence
+     * must not make the device permanently fall back to AP mode: the worker
+     * keeps retrying STA in the background and AP is only a recovery path.
+     */
+    if (wifi_start_sta() != ESP_OK)
+        (void)wifi_start_ap();
 
     start_http_server();
+
+    xTaskCreate(
+        wifi_worker_task,
+        "wifi_worker",
+        4096,
+        NULL,
+        4,
+        NULL);
 }
